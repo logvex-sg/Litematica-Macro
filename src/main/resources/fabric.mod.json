@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "id": "schematic-dropper",
+  "version": "${version}",
+  "name": "Schematic Dropper",
+  "description": "Drops the exact material quantities a Litematica schematic or an imported material list requires.",
+  "authors": [
+    "logvex"
+  ],
+  "contact": {
+    "sources": "https://github.com/logvex-sg/Litematica-Macro"
+  },
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "meteor": [
+      "com.schematicdropper.SchematicDropperAddon"
+    ]
+  },
+  "custom": {
+    "meteor-client:color": "90,160,255",
+    "modmenu": {
+      "parent": {
+        "id": "meteor-client"
+      }
+    }
+  },
+  "depends": {
+    "java": ">=21",
+    "minecraft": [
+      "${mc_version}"
+    ],
+    "meteor-client": "*"
+  },
+  "recommends": {
+    "litematica": "*"
+  }
+}

@@ -1,0 +1,95 @@
+plugins {
+    id "fabric-loom" version "${loom_version}"
+}
+
+base {
+    archivesName = project.archives_base_name
+    version = "${project.mod_version}+mc${project.minecraft_version}"
+    group = project.maven_group
+}
+
+repositories {
+    maven {
+        name = "meteor-maven"
+        url = "https://maven.meteordev.org/releases"
+    }
+    maven {
+        name = "meteor-maven-snapshots"
+        url = "https://maven.meteordev.org/snapshots"
+    }
+    maven {
+        // Sakura Ryoko's fork of Masa's mods, which is the maintained 1.21.x line.
+        name = "masa"
+        url = "https://masa.dy.fi/maven/sakura-ryoko"
+    }
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+
+    // Meteor Client
+    modImplementation "meteordevelopment:meteor-client:${project.meteor_version}"
+
+    // Fabric API - provides the modules Meteor expects at runtime.
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+
+    // Soft dependencies. Compiled against so the integration compiles, but NOT
+    // shipped and NOT required at runtime: LitematicaIntegration guards every
+    // entry point with FabricLoader.isModLoaded("litematica").
+    modCompileOnly("fi.dy.masa.litematica:litematica-fabric-1.21:${project.litematica_version}") {
+        exclude group: "net.fabricmc", module: "fabric-loader"
+    }
+    modCompileOnly("fi.dy.masa.malilib:malilib-fabric-1.21:${project.malilib_version}") {
+        exclude group: "net.fabricmc", module: "fabric-loader"
+    }
+
+    // Tests - pure logic only, no Minecraft runtime.
+    testImplementation platform("org.junit:junit-bom:5.11.3")
+    testImplementation "org.junit.jupiter:junit-jupiter"
+    testRuntimeOnly "org.junit.platform:junit-platform-launcher"
+}
+
+loom {
+    runs {
+        client {
+            programArgs "--username", "Developer"
+        }
+    }
+}
+
+processResources {
+    inputs.property "version", project.version
+    inputs.property "mc_version", project.minecraft_version
+
+    filesMatching("fabric.mod.json") {
+        expand "version": project.version, "mc_version": project.minecraft_version
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    it.options.encoding = "UTF-8"
+    it.options.release = 21
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+    withSourcesJar()
+}
+
+test {
+    useJUnitPlatform()
+    testLogging {
+        events "passed", "failed", "skipped"
+        exceptionFormat "full"
+    }
+}
+
+jar {
+    from("LICENSE") {
+        rename { "${it}_${project.base.archivesName.get()}" }
+    }
+}
