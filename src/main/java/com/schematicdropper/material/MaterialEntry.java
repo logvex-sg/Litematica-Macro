@@ -1,5 +1,7 @@
 package com.schematicdropper.material;
 
+import com.schematicdropper.drop.FailureKind;
+
 import java.util.Objects;
 
 /**
@@ -20,13 +22,20 @@ public final class MaterialEntry {
         /** Item does not exist in this client's registry. */
         MISSING,
         /** Drops were rejected repeatedly; needs user attention. */
-        STALLED
+        STALLED,
+        /**
+         * Cannot be processed right now, but may recover. The material keeps its
+         * place in the queue and is revisited rather than being abandoned.
+         */
+        BLOCKED
     }
 
     private final String id;
     private int required;
     private int dropped;
     private Status status = Status.PENDING;
+    /** Why the entry is BLOCKED, or {@code null} when it is not. */
+    private FailureKind blockedReason;
 
     public MaterialEntry(String id, int required) {
         if (required <= 0) throw new IllegalArgumentException("required must be positive, got " + required);
@@ -60,6 +69,22 @@ public final class MaterialEntry {
 
     public void status(Status status) {
         this.status = status;
+        if (status != Status.BLOCKED) this.blockedReason = null;
+    }
+
+    /** Why the entry is blocked, or {@code null} when it is not blocked. */
+    public FailureKind blockedReason() {
+        return blockedReason;
+    }
+
+    /** Marks the entry blocked with a reason, keeping its position and progress. */
+    public void block(FailureKind reason) {
+        this.status = Status.BLOCKED;
+        this.blockedReason = reason;
+    }
+
+    public boolean isBlocked() {
+        return status == Status.BLOCKED;
     }
 
     /** Adds to the requirement, used when merging duplicate imports. */
@@ -75,7 +100,10 @@ public final class MaterialEntry {
     public void confirmDropped(int count) {
         if (count <= 0) return;
         this.dropped = Math.min(required, this.dropped + count);
-        if (isComplete()) this.status = Status.DONE;
+        if (isComplete()) {
+            this.status = Status.DONE;
+            this.blockedReason = null;
+        }
     }
 
     /** Rolls back a confirmation that turned out to be a false positive. */
@@ -88,6 +116,23 @@ public final class MaterialEntry {
     public void reset() {
         this.dropped = 0;
         this.status = Status.PENDING;
+        this.blockedReason = null;
+    }
+
+    /**
+     * Restores a saved quantity without counting it as a fresh confirmation.
+     *
+     * <p>Used when a run is reloaded: the unfinished queue, and how much of each
+     * material was already confirmed, are preserved exactly. The count is clamped
+     * to the requirement, so a corrupt value cannot overshoot.
+     */
+    public void restore(int dropped) {
+        this.dropped = Math.max(0, Math.min(required, dropped));
+        if (isComplete()) {
+            this.status = Status.DONE;
+        } else if (status == Status.DONE || status == Status.MISSING) {
+            this.status = Status.PENDING;
+        }
     }
 
     public double progress() {
@@ -96,18 +141,20 @@ public final class MaterialEntry {
 
     @Override
     public String toString() {
-        return id + " " + dropped + "/" + required + " (" + status + ")";
+        String base = id + " " + dropped + "/" + required + " (" + status + ")";
+        return blockedReason == null ? base : base + "[" + blockedReason + "]";
     }
 
     @Override
     public boolean equals(Object o) {
         if (this == o) return true;
         if (!(o instanceof MaterialEntry other)) return false;
-        return required == other.required && dropped == other.dropped && status == other.status && id.equals(other.id);
+        return required == other.required && dropped == other.dropped && status == other.status
+            && blockedReason == other.blockedReason && id.equals(other.id);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(id, required, dropped, status);
+        return Objects.hash(id, required, dropped, status, blockedReason);
     }
 }

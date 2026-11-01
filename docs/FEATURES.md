@@ -16,7 +16,9 @@ them. For installation and a quick start, see the [README](../README.md).
 | `schematic-file` | string | empty | Path to the `.litematic` / `.schem` / `.schematic` file to read. |
 | `material-list` | string | empty | Path to the `.txt` / `.json` / `.csv` material list. |
 | `ignore-air` | bool | true | Skip air when counting blocks. |
-| `inventory-strategy` | enum | Direct drop | How items leave the creative inventory. See section 4. |
+| `material-order` | enum | Schematic order | The deterministic processing order. See section 2. |
+| `run-mode` | enum | Strict order | How an unavailable material is handled. See section 2. |
+| `inventory-strategy` | enum | Direct drop | How items leave the creative inventory. See section 5. |
 
 ### Speed
 
@@ -28,7 +30,12 @@ them. For installation and a quick start, see the [README](../README.md).
 | `random-delay` | int (ms) | 0 | Extra random gap, so the timing is not perfectly regular. |
 | `max-per-drop` | int | 64 | Largest stack a single send may carry. |
 | `confirm-timeout` | int (ticks) | 20 | How long to wait for a drop to be confirmed before treating it as lost. |
-| `max-attempts` | int | 1 | Sends allowed per drop. See section 3. |
+| `max-attempts` | int | 1 | Sends allowed per drop. See section 5. |
+| `allow-resend` | bool | false | Resend a timed-out drop. Off, to avoid duplicates. See section 5. |
+| `retry-delay` | int (ticks) | 10 | Base delay before retrying a failed operation. |
+| `max-retry-delay` | int (ticks) | 100 | Ceiling for the retry backoff. |
+| `max-retries` | int | 5 | Failed attempts for one material before it is blocked. |
+| `revisit-blocked` | int (ticks) | 100 | How often blocked materials are revisited. |
 
 ### Targeting
 
@@ -73,7 +80,99 @@ previous tick is already the server's current view angle.
 
 ---
 
-## 2. The exact-quantity contract
+## 2. Deterministic material order
+
+Materials are processed in a fixed order, decided once when the list is imported.
+Nothing selects a material at random, and the order does not change mid-run.
+
+| `material-order` | Result |
+|---|---|
+| **Schematic order** (default) | The order the Litematica material list or the schematic produced. |
+| **Imported list order** | The order the `.txt` / `.json` / `.csv` file listed them in. |
+| **Alphabetical** | Ascending item id, e.g. `minecraft:apple` before `minecraft:stone`. |
+| **Required quantity** | Largest requirement first, ties broken by the original order. |
+
+The chosen order is written into the saved run, so reloading a run preserves it
+even if the setting has since been changed.
+
+### Run modes
+
+`run-mode` decides what happens when the material at the head of the queue cannot
+be processed right now.
+
+**Strict order** (default)
+
+- The head material is finished - every stack of it - before the next is touched.
+- An unavailable material is never skipped. Its position and remaining quantity
+  are kept, and the scheduler waits for it.
+- Later materials are not processed while it is outstanding.
+- Resuming continues from its exact remaining quantity.
+
+**Best effort**
+
+- An unavailable material is temporarily marked `BLOCKED`.
+- The other materials are processed in their original relative order.
+- Blocked materials are revisited every `revisit-blocked` ticks.
+- The run is not complete while any blocked quantity remains.
+
+The documented example - Stone 128, Oak Planks 48, Glass 32, Iron Blocks 16 -
+is dropped as 64 + 64 stone, then 48 oak planks, then 32 glass, then 16 iron
+blocks, in that order and never interleaved.
+
+### Multiple stacks
+
+One material may need several stacks. They are all dropped before the scheduler
+advances: 200 stone is 64 + 64 + 64 + 8, then the next material. A send already in
+flight counts against the material's remaining quantity, so a slow confirmation
+cannot cause an over-drop.
+
+---
+
+## 3. Failure recovery
+
+A failed drop never ends the run.
+
+Every failure is classified, recorded with its reason and tick, and turned into an
+action:
+
+| `FailureKind` | Meaning | Response |
+|---|---|---|
+| `TEMPORARY_FAILURE` | A transient rejection. | Retry after a backoff. |
+| `INVENTORY_CHANGED` | The creative inventory is not usable. | Wait for `inventoryReady`. |
+| `TARGET_INVALID` | The configured target is gone. | Wait for a valid target. |
+| `SERVER_TIMEOUT` | No confirmation within the window. | Keep the request outstanding and wait; do not resend by default. |
+| `SERVER_REJECTION` | The send was refused. | Retry, then block after `max-retries`. |
+| `MATERIAL_UNAVAILABLE` | The client has no such item. | Block and revisit later. |
+| `PERMANENT_ERROR` | Cannot ever succeed. | Do not retry; keep the work unfinished and report it. |
+
+### Execution states
+
+The scheduler reports what it is waiting on, so the HUD and the user can see why
+nothing is being sent:
+
+| State | Meaning |
+|---|---|
+| `RETRYING` | A transient failure is being retried after a backoff. |
+| `RECOVERING` | Blocked materials are being revisited after a wait. |
+| `BLOCKED` | A material cannot currently be processed and keeps its queue position. |
+| `WAITING_FOR_INVENTORY` | The creative inventory is not usable right now. |
+| `WAITING_FOR_TARGET` | The looked-at target is missing. |
+| `WAITING_FOR_SERVER` | A drop is unconfirmed and is not being resent. |
+
+### Bounded retries and backoff
+
+Retries use an exponential backoff: `retry-delay` doubled per attempt, capped at
+`max-retry-delay`. After `max-retries` failed attempts the material is marked
+`BLOCKED` rather than abandoned. The block keeps the material's queue position and
+its remaining quantity, and it is revisited every `revisit-blocked` ticks.
+
+While waiting, the scheduler does not re-send an identical request. A material
+blocked on a slow server does not stop the other materials from progressing in
+Best effort mode.
+
+---
+
+## 4. The exact-quantity contract
 
 Given
 
@@ -108,7 +207,7 @@ tested directly.
 
 ---
 
-## 3. Confirmed drops
+## 5. Confirmed drops
 
 ### Why the client cannot be trusted
 
@@ -146,17 +245,20 @@ ask for a second batch of items.
 
 ### Retries are off by default
 
-With `max-attempts: 1` (the default), an unconfirmed drop stalls the run:
+With `allow-resend: false` (the default), an unconfirmed drop is not resent. The
+request is kept outstanding and the material is reported as waiting on the server:
 
 ```
-Server never confirmed 64 x minecraft:stone; stopping to avoid dropping duplicates
+Waiting for the server to confirm 64 x minecraft:stone; not resending to avoid duplicates
 ```
 
 This is deliberate. A server that is merely slow would receive a second drop on a
-retry, and the world would end up with items the user did not ask for. Stopping is
-the safe failure: nothing is lost, and the user can look at the situation.
+retry, and the world would end up with items the user did not ask for. Keeping the
+request outstanding is the safe choice: nothing is lost, a late confirmation is
+still honoured, and the user can see what the scheduler is waiting on.
 
-Raising `max-attempts` trades that safety for resilience. It is the user's call.
+Setting `allow-resend` to true trades that safety for resilience on a genuinely
+lossy connection. It is the user's call.
 
 ### The observation radius
 
@@ -175,7 +277,7 @@ the extra packets are discarded. The scheduler clamps to this ceiling
 
 ---
 
-## 4. Creative inventory strategies
+## 6. Creative inventory strategies
 
 ### Direct drop
 
@@ -209,7 +311,7 @@ and capped by the server's ceiling.
 
 ---
 
-## 5. Architecture
+## 7. Architecture
 
 ```
 SchematicDropper            Meteor module; owns the task, the handlers, the tick
@@ -264,7 +366,7 @@ in the drop path runs off the client thread.
 
 ---
 
-## 6. Input sources
+## 8. Input sources
 
 ### Litematica
 
@@ -301,7 +403,7 @@ plain object map.
 
 ---
 
-## 7. Reliability
+## 9. Reliability
 
 | Risk | Handling |
 |---|---|
@@ -316,10 +418,15 @@ plain object map.
 | Another player's drop | Ignored - outside the observation radius. |
 | Duplicated entity event | Cannot over-credit; the ledger ceilings at what was sent. |
 | Large schematic | Parsed off-thread; result applied on the client thread. |
+| Failed drop | Classified, recorded and retried, waited out or blocked; the run continues. |
+| Unconfirmed drop | Kept outstanding and never resent by default, so no duplicate is created. |
+| Unavailable material | Blocked in place, keeping its queue position and remaining quantity. |
+| Interrupted run | The queue, its order and confirmed progress are saved and restored. |
+| Restart after a stop | Resumes the exact remaining quantities rather than starting over. |
 
 ---
 
-## 8. Known limitations
+## 10. Known limitations
 
 - **Creative mode only.** The server ignores creative inventory packets from a
   non-creative player, and the module aborts rather than firing them into the void.
@@ -327,7 +434,10 @@ plain object map.
   block; the run reports "no target" rather than scattering items at a wall.
 - **`.schematic` (legacy MCEdit)** support depends on the file's contents. The
   modern formats are the reliable path.
-- **No automatic resume.** By design. See section 7.
+- **No automatic resume.** By design. See section 9. A stopped run keeps its
+  unfinished queue, though: starting again resumes it rather than starting over.
+- **Strict order waits indefinitely for the head material.** If it can never be
+  obtained, switch to Best effort so the rest of the queue can proceed.
 - **Litematica's own list is the source of truth** for the placement source, so any
   inaccuracy there is inherited here. That is preferable to a second, subtly
   different implementation.

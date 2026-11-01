@@ -87,6 +87,7 @@ public class SchematicDropperHud extends HudElement {
     private double progress;
     private int totalDropped;
     private int totalRequired;
+    private int blockedCount;
     private List<MaterialEntry> rows = List.of();
     private int hiddenRows;
 
@@ -155,6 +156,7 @@ public class SchematicDropperHud extends HudElement {
         this.progress = materials.overallProgress();
         this.totalDropped = materials.totalDropped();
         this.totalRequired = materials.totalRequired();
+        this.blockedCount = materials.blockedCount();
 
         boolean remainingOnly = onlyRemaining.get();
         List<MaterialEntry> all = materials.all();
@@ -216,6 +218,7 @@ public class SchematicDropperHud extends HudElement {
         Color heading = new Color(90, 160, 255);
         Color done = new Color(120, 220, 120);
         Color missing = new Color(255, 120, 120);
+        Color blocked = new Color(255, 190, 90);
 
         if (compact.get()) {
             renderer.text(summaryLine(), x, y, text, false, s);
@@ -227,6 +230,7 @@ public class SchematicDropperHud extends HudElement {
 
         for (MaterialEntry row : rows) {
             Color color = row.status() == MaterialEntry.Status.MISSING ? missing
+                : row.isBlocked() ? blocked
                 : row.isComplete() ? done
                 : text;
             renderer.text(materialLine(row), x, y, color, false, s);
@@ -249,13 +253,18 @@ public class SchematicDropperHud extends HudElement {
         if (row.status() == MaterialEntry.Status.MISSING) {
             return pad(name) + " missing";
         }
+        if (row.isBlocked()) {
+            String reason = row.blockedReason() == null ? "blocked" : row.blockedReason().name().toLowerCase(java.util.Locale.ROOT);
+            return pad(name) + padLeft(row.dropped() + " / " + row.required()) + " " + reason;
+        }
         return pad(name) + padLeft(row.dropped() + " / " + row.required())
             + " " + percent(row.progress());
     }
 
     private String summaryLine() {
-        return "Total: " + totalDropped + " / " + totalRequired
+        String base = "Total: " + totalDropped + " / " + totalRequired
             + "  " + percent(progress);
+        return blockedCount > 0 ? base + "  blocked: " + blockedCount : base;
     }
 
     private String stateLine() {

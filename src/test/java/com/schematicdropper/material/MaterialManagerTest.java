@@ -292,4 +292,147 @@ class MaterialManagerTest {
         // An empty list is not a finished one: nothing was ever dropped.
         assertFalse(manager.isComplete());
     }
+
+    // ----------------------------------------------------------- ORDERING
+
+    @Test
+    void schematicOrderIsTheSourceOrder() {
+        MaterialManager manager = manager();
+        assertEquals(
+            List.of("minecraft:stone", "minecraft:dirt", "minecraft:glass"),
+            manager.order());
+        assertEquals("minecraft:stone", manager.firstPending().id());
+    }
+
+    @Test
+    void alphabeticalOrderIsAppliedToTheQueue() {
+        Map<String, Integer> materials = new LinkedHashMap<>();
+        materials.put("minecraft:stone", 1);
+        materials.put("minecraft:apple", 1);
+        materials.put("minecraft:zombie_head", 1);
+
+        MaterialManager manager = new MaterialManager();
+        manager.setFrom(materials, MaterialOrder.ALPHABETICAL);
+
+        assertEquals(
+            List.of("minecraft:apple", "minecraft:stone", "minecraft:zombie_head"),
+            manager.order());
+    }
+
+    @Test
+    void requiredQuantityOrderIsLargestFirst() {
+        Map<String, Integer> materials = new LinkedHashMap<>();
+        materials.put("minecraft:stone", 10);
+        materials.put("minecraft:dirt", 128);
+        materials.put("minecraft:glass", 64);
+
+        MaterialManager manager = new MaterialManager();
+        manager.setFrom(materials, MaterialOrder.REQUIRED_QUANTITY);
+
+        assertEquals(
+            List.of("minecraft:dirt", "minecraft:glass", "minecraft:stone"),
+            manager.order());
+    }
+
+    @Test
+    void firstPendingSkipsCompletedMaterialsButKeepsBlockedOnes() {
+        MaterialManager manager = manager();
+        manager.confirm("minecraft:stone", 130);
+        manager.markBlocked("minecraft:dirt", com.schematicdropper.drop.FailureKind.MATERIAL_UNAVAILABLE);
+
+        // The completed material is skipped; the blocked one keeps its place.
+        assertEquals("minecraft:dirt", manager.firstPending().id());
+        // Best effort walks past the blocked material.
+        assertEquals("minecraft:glass", manager.firstProcessable().id());
+    }
+
+    @Test
+    void blockedMaterialsKeepTheirQueuePositionAndRemaining() {
+        MaterialManager manager = manager();
+        manager.confirm("minecraft:stone", 64);
+        manager.markBlocked("minecraft:stone", com.schematicdropper.drop.FailureKind.SERVER_TIMEOUT);
+
+        assertEquals(
+            List.of("minecraft:stone", "minecraft:dirt", "minecraft:glass"),
+            manager.order(),
+            "blocking must not reorder the queue");
+        assertEquals(66, manager.get("minecraft:stone").remaining());
+        assertEquals(1, manager.blockedCount());
+        assertTrue(manager.hasBlocked());
+        assertEquals(66, manager.blockedRemaining());
+
+        manager.unblock("minecraft:stone");
+        assertEquals(0, manager.blockedCount());
+        assertEquals(MaterialEntry.Status.PENDING, manager.get("minecraft:stone").status());
+        // The confirmed progress is untouched by blocking and unblocking.
+        assertEquals(64, manager.get("minecraft:stone").dropped());
+    }
+
+    @Test
+    void aRunIsNotCompleteWhileAnythingIsBlocked() {
+        MaterialManager manager = manager();
+        manager.confirm("minecraft:stone", 130);
+        manager.confirm("minecraft:dirt", 70);
+        manager.confirm("minecraft:glass", 17);
+        assertTrue(manager.isComplete());
+
+        // Revoke a little and block it: the run is no longer complete.
+        manager.revoke("minecraft:glass", 1);
+        manager.markBlocked("minecraft:glass", com.schematicdropper.drop.FailureKind.MATERIAL_UNAVAILABLE);
+        assertFalse(manager.isComplete());
+    }
+
+    // ------------------------------------------------- RUN PERSISTENCE
+
+    @Test
+    void serializeRunRoundTripsOrderAndProgress() {
+        MaterialManager manager = manager();
+        manager.confirm("minecraft:stone", 130);
+        manager.confirm("minecraft:dirt", 35);
+
+        MaterialManager restored = new MaterialManager();
+        int count = restored.deserializeRun(manager.serializeRun());
+
+        assertEquals(3, count);
+        assertEquals(manager.order(), restored.order());
+        assertEquals(130, restored.get("minecraft:stone").dropped());
+        assertEquals(35, restored.get("minecraft:dirt").dropped());
+        assertEquals(0, restored.get("minecraft:glass").dropped());
+        assertTrue(restored.get("minecraft:stone").isComplete());
+        assertEquals(217 - 165, restored.totalRemaining());
+    }
+
+    @Test
+    void deserializeRunSkipsMalformedLines() {
+        MaterialManager manager = new MaterialManager();
+        int count = manager.deserializeRun(
+            "0|minecraft:stone|64|32\n"
+                + "garbage\n"
+                + "1||64|0\n"
+                + "2|minecraft:dirt|notanumber|0\n"
+                + "3|minecraft:glass|0|0\n"
+                + "4|minecraft:sand|16|4");
+
+        assertEquals(2, count);
+        assertEquals(List.of("minecraft:stone", "minecraft:sand"), manager.order());
+        assertEquals(32, manager.get("minecraft:stone").dropped());
+        assertEquals(4, manager.get("minecraft:sand").dropped());
+    }
+
+    @Test
+    void deserializeRunClampsProgressToTheRequirement() {
+        MaterialManager manager = new MaterialManager();
+        manager.deserializeRun("0|minecraft:stone|64|9999");
+
+        assertEquals(64, manager.get("minecraft:stone").dropped());
+        assertEquals(0, manager.get("minecraft:stone").remaining());
+    }
+
+    @Test
+    void deserializeRunOfNothingLeavesAnEmptyList() {
+        MaterialManager manager = new MaterialManager();
+        assertEquals(0, manager.deserializeRun(null));
+        assertEquals(0, manager.deserializeRun(""));
+        assertTrue(manager.isEmpty());
+    }
 }

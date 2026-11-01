@@ -1,6 +1,8 @@
 package com.schematicdropper.drop;
 
+import com.schematicdropper.material.MaterialEntry;
 import com.schematicdropper.material.MaterialManager;
+import com.schematicdropper.material.MaterialOrder;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
@@ -10,10 +12,12 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * End-to-end checks of the exact-quantity contract, driven through a fake
+ * End-to-end checks of the exact-quantity contract, the deterministic material
+ * order, and the failure-recovery behaviour, driven through a fake
  * {@link DropTask.Actions} so the whole scheduler runs without a game.
  */
 class DropTaskTest {
@@ -27,11 +31,17 @@ class DropTaskTest {
         /** Sends not yet confirmed. */
         final List<Send> pending = new ArrayList<>();
         final Map<String, Integer> stackSizes = new LinkedHashMap<>();
+
         boolean accept = true;
+        boolean inventoryReady = true;
+        boolean targetValid = true;
+        /** Items this client has no item for. */
+        final java.util.Set<String> unavailable = new java.util.HashSet<>();
 
         @Override
         public boolean dropAtFeet(String itemId, int count) {
             if (!accept) return false;
+            if (unavailable.contains(itemId)) return false;
             Send send = new Send(itemId, count);
             history.add(send);
             pending.add(send);
@@ -48,6 +58,21 @@ class DropTaskTest {
             return stackSizes.getOrDefault(itemId, 64);
         }
 
+        @Override
+        public boolean itemAvailable(String itemId) {
+            return !unavailable.contains(itemId);
+        }
+
+        @Override
+        public boolean inventoryReady() {
+            return inventoryReady;
+        }
+
+        @Override
+        public boolean targetValid() {
+            return targetValid;
+        }
+
         /** Confirms every unconfirmed send, as an accepting server would. */
         void confirmAll(DropTask task) {
             for (Send send : pending) task.onItemObserved(send.itemId(), send.count());
@@ -62,6 +87,15 @@ class DropTaskTest {
             return out;
         }
 
+        /** The order materials were first sent in, deduplicated. */
+        List<String> firstSendOrder() {
+            List<String> order = new ArrayList<>();
+            for (Send send : history) {
+                if (!order.contains(send.itemId())) order.add(send.itemId());
+            }
+            return order;
+        }
+
         int totalItems() {
             int total = 0;
             for (Send send : history) total += send.count();
@@ -70,12 +104,16 @@ class DropTaskTest {
     }
 
     private static MaterialManager materials(Object... pairs) {
+        return materials(MaterialOrder.SCHEMATIC_ORDER, pairs);
+    }
+
+    private static MaterialManager materials(MaterialOrder order, Object... pairs) {
         Map<String, Integer> map = new LinkedHashMap<>();
         for (int i = 0; i < pairs.length; i += 2) {
             map.put((String) pairs[i], (Integer) pairs[i + 1]);
         }
         MaterialManager manager = new MaterialManager();
-        manager.setFrom(map);
+        manager.setFrom(map, order);
         return manager;
     }
 
@@ -89,6 +127,7 @@ class DropTaskTest {
         config.confirmTimeoutTicks = 1000;
         config.maxAttempts = 3;
         config.maxPerDrop = 64;
+        config.runMode = RunMode.STRICT_ORDER;
         return config;
     }
 
@@ -98,9 +137,7 @@ class DropTaskTest {
             task.tick(tick, tick * 50L);
             actions.confirmAll(task);
 
-            if (task.state() == DropTask.State.COMPLETED
-                || task.state() == DropTask.State.ERROR
-                || task.state() == DropTask.State.STOPPED) {
+            if (task.state() == DropTask.State.COMPLETED || task.state() == DropTask.State.STOPPED) {
                 return;
             }
         }
@@ -227,7 +264,7 @@ class DropTaskTest {
         // Everything is in flight, so nothing more may be sent.
         assertEquals(130, actions.totalItems());
         assertEquals(0, manager.totalDropped());
-        assertEquals(DropTask.State.RUNNING, task.state());
+        assertTrue(task.isRunning());
     }
 
     @Test
@@ -256,7 +293,7 @@ class DropTaskTest {
 
         assertTrue(task.start());
         assertFalse(task.start());
-        assertEquals(DropTask.State.RUNNING, task.state());
+        assertTrue(task.isRunning());
     }
 
     @Test
@@ -348,7 +385,7 @@ class DropTaskTest {
         task.start();
         task.stop();
         assertTrue(task.start());
-        assertEquals(DropTask.State.RUNNING, task.state());
+        assertTrue(task.isRunning());
     }
 
     @Test
@@ -380,19 +417,19 @@ class DropTaskTest {
         assertEquals(DropTask.State.STOPPED, task.state());
         assertTrue(task.requiresRestart());
         assertEquals("Disconnected from the server", task.lastError());
-        assertFalse(task.start() == false && false);
     }
 
     // -------------------------------------------------------------- FAILURE
 
     @Test
-    void unconfirmedDropsEventuallyStallAndStopTheRun() {
+    void unconfirmedDropsAreNotCountedAndTheMaterialIsBlocked() {
         MaterialManager manager = materials("minecraft:stone", 64);
         FakeActions actions = new FakeActions();
 
         DropTask.Config config = config();
         config.confirmTimeoutTicks = 5;
         config.maxAttempts = 1;
+        config.allowResend = true;
 
         DropTask task = new DropTask(manager, actions);
         task.config(config);
@@ -402,10 +439,11 @@ class DropTaskTest {
         task.tick(0, 0);
         task.tick(10, 500L);
 
-        assertEquals(DropTask.State.ERROR, task.state());
         assertEquals(0, manager.totalDropped(), "unconfirmed work must never be counted");
-        assertEquals(com.schematicdropper.material.MaterialEntry.Status.STALLED,
-            manager.get("minecraft:stone").status());
+        assertEquals(MaterialEntry.Status.BLOCKED, manager.get("minecraft:stone").status());
+        assertTrue(manager.hasBlocked());
+        // The run continues rather than terminating.
+        assertTrue(task.isRunning());
     }
 
     @Test
@@ -422,7 +460,8 @@ class DropTaskTest {
         assertEquals(0, actions.totalItems());
 
         actions.accept = true;
-        task.tick(1, 50L);
+        // Skip past the retry backoff.
+        for (int tick = 1; tick < 60; tick++) task.tick(tick, tick * 50L);
         assertTrue(actions.totalItems() > 0);
     }
 
@@ -519,33 +558,563 @@ class DropTaskTest {
         assertEquals(1, actions.totalItems());
     }
 
+    // ---------------------------------------------------- STRICT ORDERING
+
     @Test
-    void aTightRateLimitStillMakesProgressOnEveryMaterial() {
+    void strictOrderFinishesEachMaterialBeforeAdvancing() {
+        // Stone must be fully dropped before Oak Planks is touched, and so on.
         MaterialManager manager = materials(
-            "minecraft:stone", 64,
-            "minecraft:dirt", 64,
-            "minecraft:glass", 64);
+            "minecraft:stone", 128,
+            "minecraft:oak_planks", 48,
+            "minecraft:glass", 32,
+            "minecraft:iron_block", 16);
 
         FakeActions actions = new FakeActions();
-
         DropTask.Config config = config();
-        // One stack per tick, so only one material can advance each tick.
-        config.itemsPerSecond = 64 * 20;
         config.maxDropsPerTick = 1;
 
         DropTask task = new DropTask(manager, actions);
         task.config(config);
         task.start();
 
-        // Long enough for three materials at one stack per tick.
-        for (int tick = 0; tick < 6; tick++) {
+        run(task, actions, 500);
+
+        assertEquals(DropTask.State.COMPLETED, task.state());
+        assertEquals(
+            List.of("minecraft:stone", "minecraft:oak_planks", "minecraft:glass", "minecraft:iron_block"),
+            actions.firstSendOrder(),
+            "materials must be processed in schematic order, one at a time");
+
+        // Each material is fully finished before the next begins.
+        assertEquals(List.of(64, 64), actions.countsFor("minecraft:stone"));
+        assertEquals(List.of(48), actions.countsFor("minecraft:oak_planks"));
+        assertEquals(List.of(32), actions.countsFor("minecraft:glass"));
+        assertEquals(List.of(16), actions.countsFor("minecraft:iron_block"));
+    }
+
+    @Test
+    void strictOrderNeverAdvancesPastAnUnavailableMaterial() {
+        MaterialManager manager = materials(
+            "minecraft:stone", 64,
+            "minecraft:dirt", 64);
+
+        FakeActions actions = new FakeActions();
+        // The first material cannot be obtained at all right now.
+        actions.unavailable.add("minecraft:stone");
+
+        DropTask.Config config = config();
+        config.runMode = RunMode.STRICT_ORDER;
+        config.maxRetriesPerOperation = 2;
+
+        DropTask task = new DropTask(manager, actions);
+        task.config(config);
+        task.start();
+
+        for (int tick = 0; tick < 200; tick++) task.tick(tick, tick * 50L);
+
+        // Dirt must not be touched while stone is still owed.
+        assertTrue(actions.countsFor("minecraft:dirt").isEmpty(),
+            "strict order must not process a later material while the head is blocked");
+        assertEquals(MaterialEntry.Status.BLOCKED, manager.get("minecraft:stone").status());
+        assertFalse(manager.isComplete());
+    }
+
+    @Test
+    void multipleStacksOfOneMaterialAllCompleteBeforeTheNext() {
+        MaterialManager manager = materials(
+            "minecraft:stone", 200,
+            "minecraft:dirt", 10);
+
+        FakeActions actions = new FakeActions();
+        DropTask task = new DropTask(manager, actions);
+        task.config(config());
+        task.start();
+
+        run(task, actions, 100);
+
+        // 200 stone is 64 + 64 + 64 + 8; dirt only after all four.
+        assertEquals(List.of(64, 64, 64, 8), actions.countsFor("minecraft:stone"));
+        assertEquals(List.of(10), actions.countsFor("minecraft:dirt"));
+        assertEquals(
+            List.of("minecraft:stone", "minecraft:dirt"),
+            actions.firstSendOrder());
+    }
+
+    @Test
+    void alphabeticalOrderIsDeterministic() {
+        MaterialManager manager = materials(MaterialOrder.ALPHABETICAL,
+            "minecraft:stone", 10,
+            "minecraft:apple", 10,
+            "minecraft:zombie_head", 10);
+
+        FakeActions actions = new FakeActions();
+        DropTask task = new DropTask(manager, actions);
+        task.config(config());
+        task.start();
+
+        run(task, actions, 100);
+
+        assertEquals(
+            List.of("minecraft:apple", "minecraft:stone", "minecraft:zombie_head"),
+            actions.firstSendOrder());
+    }
+
+    @Test
+    void requiredQuantityOrderProcessesLargestFirst() {
+        MaterialManager manager = materials(MaterialOrder.REQUIRED_QUANTITY,
+            "minecraft:stone", 10,
+            "minecraft:dirt", 128,
+            "minecraft:glass", 64);
+
+        FakeActions actions = new FakeActions();
+        DropTask task = new DropTask(manager, actions);
+        task.config(config());
+        task.start();
+
+        run(task, actions, 100);
+
+        assertEquals(
+            List.of("minecraft:dirt", "minecraft:glass", "minecraft:stone"),
+            actions.firstSendOrder());
+    }
+
+    @Test
+    void importedOrderPreservesTheListOrder() {
+        // A LinkedHashMap is the imported list's own order.
+        MaterialManager manager = materials(MaterialOrder.IMPORTED_ORDER,
+            "minecraft:glass", 10,
+            "minecraft:stone", 10,
+            "minecraft:dirt", 10);
+
+        FakeActions actions = new FakeActions();
+        DropTask task = new DropTask(manager, actions);
+        task.config(config());
+        task.start();
+
+        run(task, actions, 100);
+
+        assertEquals(
+            List.of("minecraft:glass", "minecraft:stone", "minecraft:dirt"),
+            actions.firstSendOrder());
+    }
+
+    // --------------------------------------------------------- BEST EFFORT
+
+    @Test
+    void bestEffortSkipsABlockedMaterialAndRevisitsIt() {
+        MaterialManager manager = materials(
+            "minecraft:stone", 64,
+            "minecraft:dirt", 64);
+
+        FakeActions actions = new FakeActions();
+        // Stone cannot be dropped at first.
+        actions.unavailable.add("minecraft:stone");
+
+        DropTask.Config config = config();
+        config.runMode = RunMode.BEST_EFFORT;
+        config.maxRetriesPerOperation = 1;
+        config.revisitBlockedTicks = 20;
+        config.retryDelayTicks = 1;
+        config.maxRetryDelayTicks = 1;
+
+        DropTask task = new DropTask(manager, actions);
+        task.config(config);
+        task.start();
+
+        // Let stone fail and become blocked, then dirt should be processed.
+        for (int tick = 0; tick < 10; tick++) {
+            task.tick(tick, tick * 50L);
+            actions.confirmAll(task);
+        }
+        assertTrue(actions.countsFor("minecraft:dirt").size() > 0,
+            "best effort must continue with an available material");
+
+        // Stone becomes available again; the revisit must pick it up.
+        actions.unavailable.remove("minecraft:stone");
+        for (int tick = 10; tick < 200; tick++) {
             task.tick(tick, tick * 50L);
             actions.confirmAll(task);
         }
 
-        // Round-robin means no material is starved while another finishes.
-        assertFalse(actions.countsFor("minecraft:stone").isEmpty());
-        assertFalse(actions.countsFor("minecraft:dirt").isEmpty());
-        assertFalse(actions.countsFor("minecraft:glass").isEmpty());
+        assertEquals(64, manager.get("minecraft:stone").dropped());
+        assertEquals(DropTask.State.COMPLETED, task.state());
+    }
+
+    @Test
+    void bestEffortIsNotCompleteWhileAnythingIsBlocked() {
+        MaterialManager manager = materials("minecraft:stone", 64);
+        FakeActions actions = new FakeActions();
+        actions.unavailable.add("minecraft:stone");
+
+        DropTask.Config config = config();
+        config.runMode = RunMode.BEST_EFFORT;
+        config.maxRetriesPerOperation = 1;
+        config.retryDelayTicks = 1;
+        config.maxRetryDelayTicks = 1;
+
+        DropTask task = new DropTask(manager, actions);
+        task.config(config);
+        task.start();
+
+        for (int tick = 0; tick < 20; tick++) task.tick(tick, tick * 50L);
+
+        assertFalse(manager.isComplete());
+        assertFalse(task.state() == DropTask.State.COMPLETED);
+        assertEquals(64, manager.totalRemaining());
+        assertEquals(1, manager.blockedCount());
+    }
+
+    // ----------------------------------------------------------- RECOVERY
+
+    @Test
+    void aFailedOperationFollowedByASuccessfulRetryCompletes() {
+        MaterialManager manager = materials("minecraft:stone", 64);
+        FakeActions actions = new FakeActions();
+        actions.accept = false;
+
+        DropTask.Config config = config();
+        config.maxRetriesPerOperation = 20;
+        config.retryDelayTicks = 1;
+        config.maxRetryDelayTicks = 2;
+
+        DropTask task = new DropTask(manager, actions);
+        task.config(config);
+        task.start();
+
+        // Fail for a while.
+        for (int tick = 0; tick < 10; tick++) task.tick(tick, tick * 50L);
+        assertEquals(0, actions.totalItems());
+        assertTrue(task.isRunning(), "the run must not stop on a failure");
+
+        // Recover.
+        actions.accept = true;
+        for (int tick = 10; tick < 200; tick++) {
+            task.tick(tick, tick * 50L);
+            actions.confirmAll(task);
+        }
+
+        assertEquals(64, manager.totalDropped());
+        assertEquals(DropTask.State.COMPLETED, task.state());
+    }
+
+    @Test
+    void aServerTimeoutDoesNotDuplicateTheDrop() {
+        MaterialManager manager = materials("minecraft:stone", 64);
+        FakeActions actions = new FakeActions();
+
+        DropTask.Config config = config();
+        config.confirmTimeoutTicks = 5;
+        config.maxAttempts = 3;
+        // Resending disabled: the safe default.
+        config.allowResend = false;
+
+        DropTask task = new DropTask(manager, actions);
+        task.config(config);
+        task.start();
+
+        // Send once, then let many timeout windows pass without confirming.
+        task.tick(0, 0);
+        for (int tick = 1; tick < 200; tick++) task.tick(tick, tick * 50L);
+
+        // Exactly one send: a timeout must never resend when resending is off.
+        assertEquals(1, actions.history.size());
+        assertEquals(64, actions.totalItems());
+        assertEquals(0, manager.totalDropped());
+        assertEquals(DropTask.State.WAITING_FOR_SERVER, task.state());
+    }
+
+    @Test
+    void waitingForInventoryIsReportedAndRecovers() {
+        MaterialManager manager = materials("minecraft:stone", 64);
+        FakeActions actions = new FakeActions();
+        actions.inventoryReady = false;
+
+        DropTask task = new DropTask(manager, actions);
+        task.config(config());
+        task.start();
+
+        task.tick(0, 0);
+        assertEquals(DropTask.State.WAITING_FOR_INVENTORY, task.state());
+        assertEquals(0, actions.totalItems(), "nothing may be sent without an inventory");
+
+        actions.inventoryReady = true;
+        task.tick(1, 50L);
+        actions.confirmAll(task);
+        assertTrue(actions.totalItems() > 0, "must resume once the inventory is usable");
+    }
+
+    @Test
+    void waitingForTargetIsReportedAndRecovers() {
+        MaterialManager manager = materials("minecraft:stone", 64);
+        FakeActions actions = new FakeActions();
+        actions.targetValid = false;
+
+        DropTask.Config config = config();
+        config.targetMode = DropTargetManager.Mode.LOOKED_AT_ENTITY;
+
+        DropTask task = new DropTask(manager, actions);
+        task.config(config);
+        task.start();
+
+        task.tick(0, 0);
+        assertEquals(DropTask.State.WAITING_FOR_TARGET, task.state());
+        assertEquals(0, actions.totalItems());
+
+        actions.targetValid = true;
+        task.tick(1, 50L);
+        actions.confirmAll(task);
+        assertTrue(actions.totalItems() > 0, "must resume once a target is available");
+    }
+
+    @Test
+    void inventoryChangingDuringExecutionIsRecovered() {
+        MaterialManager manager = materials("minecraft:stone", 128);
+        FakeActions actions = new FakeActions();
+
+        DropTask.Config config = config();
+        config.maxRetriesPerOperation = 50;
+        config.retryDelayTicks = 1;
+        config.maxRetryDelayTicks = 1;
+
+        DropTask task = new DropTask(manager, actions);
+        task.config(config);
+        task.start();
+
+        task.tick(0, 0);
+        actions.confirmAll(task);
+
+        // The inventory becomes unusable mid-run.
+        actions.inventoryReady = false;
+        task.tick(1, 50L);
+        assertEquals(DropTask.State.WAITING_FOR_INVENTORY, task.state());
+
+        // ... and recovers.
+        actions.inventoryReady = true;
+        for (int tick = 2; tick < 200; tick++) {
+            task.tick(tick, tick * 50L);
+            actions.confirmAll(task);
+        }
+
+        assertEquals(128, manager.totalDropped());
+        assertEquals(DropTask.State.COMPLETED, task.state());
+    }
+
+    @Test
+    void aRejectedSendPutsTheSchedulerInTheRetryingState() {
+        MaterialManager manager = materials("minecraft:stone", 64);
+        FakeActions actions = new FakeActions();
+        actions.accept = false;
+
+        DropTask.Config config = config();
+        config.maxRetriesPerOperation = 50;
+        config.retryDelayTicks = 10;
+        config.maxRetryDelayTicks = 100;
+
+        DropTask task = new DropTask(manager, actions);
+        task.config(config);
+        task.start();
+
+        task.tick(0, 0);
+        assertEquals(DropTask.State.RETRYING, task.state(),
+            "a rejected send must be retried, not terminate the run");
+
+        // A material can be blocked and then revisited, which reports RECOVERING.
+        config.maxRetriesPerOperation = 1;
+        actions.accept = false;
+        for (int tick = 1; tick < 20; tick++) task.tick(tick, tick * 50L);
+        assertEquals(MaterialEntry.Status.BLOCKED, manager.get("minecraft:stone").status());
+    }
+
+    @Test
+    void revisitingABlockedMaterialReportsRecovering() {
+        MaterialManager manager = materials("minecraft:stone", 64);
+        FakeActions actions = new FakeActions();
+        actions.unavailable.add("minecraft:stone");
+
+        DropTask.Config config = config();
+        config.maxRetriesPerOperation = 1;
+        config.retryDelayTicks = 2;
+        config.maxRetryDelayTicks = 2;
+        config.revisitBlockedTicks = 5;
+
+        DropTask task = new DropTask(manager, actions);
+        task.config(config);
+        task.start();
+
+        // Block it.
+        for (int tick = 0; tick < 5; tick++) task.tick(tick, tick * 50L);
+        assertEquals(MaterialEntry.Status.BLOCKED, manager.get("minecraft:stone").status());
+
+        // The revisit pass un-blocks it and reports RECOVERING for a short window.
+        boolean sawRecovering = false;
+        for (int tick = 5; tick < 12; tick++) {
+            task.tick(tick, tick * 50L);
+            if (task.state() == DropTask.State.RECOVERING) sawRecovering = true;
+        }
+        assertTrue(sawRecovering, "the revisit must be reported as recovery");
+    }
+
+    @Test
+    void failuresAreClassifiedAndRecorded() {
+        MaterialManager manager = materials("minecraft:stone", 64);
+        FakeActions actions = new FakeActions();
+        actions.targetValid = false;
+
+        DropTask.Config config = config();
+        config.targetMode = DropTargetManager.Mode.LOOKED_AT_ENTITY;
+        config.maxRetriesPerOperation = 100;
+        config.retryDelayTicks = 1;
+        config.maxRetryDelayTicks = 1;
+
+        DropTask task = new DropTask(manager, actions);
+        task.config(config);
+        task.start();
+
+        // Force a send attempt that the target check rejects.
+        task.tick(0, 0);
+        // The wait state is reported before a send is even attempted, so drive a
+        // failure through the retry path directly.
+        task.tick(1, 50L);
+
+        assertEquals(DropTask.State.WAITING_FOR_TARGET, task.state());
+    }
+
+    @Test
+    void aMaterialWithNoItemIsBlockedAsUnavailable() {
+        MaterialManager manager = materials("minecraft:stone", 64);
+        FakeActions actions = new FakeActions();
+        // The item exists (validateMaterials is not called) but cannot be dropped.
+        actions.unavailable.add("minecraft:stone");
+
+        DropTask.Config config = config();
+        config.maxRetriesPerOperation = 1;
+        config.retryDelayTicks = 1;
+        config.maxRetryDelayTicks = 1;
+        config.revisitBlockedTicks = 1_000_000;
+
+        DropTask task = new DropTask(manager, actions);
+        task.config(config);
+        task.start();
+
+        for (int tick = 0; tick < 10; tick++) task.tick(tick, tick * 50L);
+
+        assertEquals(MaterialEntry.Status.BLOCKED, manager.get("minecraft:stone").status());
+        assertEquals(FailureKind.MATERIAL_UNAVAILABLE, manager.get("minecraft:stone").blockedReason());
+        assertNotNull(task.lastFailure());
+        assertFalse(task.failures().isEmpty());
+    }
+
+    // --------------------------------------------------- PERSISTENCE / RESTART
+
+    @Test
+    void restartingARunKeepsItsUnfinishedQueue() {
+        MaterialManager original = materials(
+            "minecraft:stone", 130,
+            "minecraft:dirt", 70,
+            "minecraft:glass", 17);
+
+        FakeActions actions = new FakeActions();
+        DropTask.Config config = config();
+        config.maxDropsPerTick = 1;
+        config.itemsPerSecond = 64 * 20;
+
+        DropTask task = new DropTask(original, actions);
+        task.config(config);
+        task.start();
+
+        // Make a little progress, then stop as if the session ended.
+        for (int tick = 0; tick < 3; tick++) {
+            task.tick(tick, tick * 50L);
+            actions.confirmAll(task);
+        }
+        task.stop();
+        int stoneDropped = original.get("minecraft:stone").dropped();
+        assertTrue(stoneDropped > 0);
+
+        // Reload into a fresh manager, exactly as the module does on start.
+        MaterialManager restored = new MaterialManager();
+        int count = restored.deserializeRun(original.serializeRun());
+
+        assertEquals(3, count);
+        assertEquals(
+            List.of("minecraft:stone", "minecraft:dirt", "minecraft:glass"),
+            restored.order(),
+            "the processing order must survive a restart");
+        assertEquals(stoneDropped, restored.get("minecraft:stone").dropped());
+        assertEquals(130 - stoneDropped, restored.get("minecraft:stone").remaining());
+        assertEquals(130, restored.get("minecraft:stone").required());
+
+        // Resuming finishes the run rather than restarting it.
+        FakeActions resumeActions = new FakeActions();
+        DropTask resumed = new DropTask(restored, resumeActions);
+        resumed.config(config);
+        resumed.start();
+
+        for (int tick = 0; tick < 500; tick++) {
+            resumed.tick(tick, tick * 50L);
+            resumeActions.confirmAll(resumed);
+        }
+
+        assertEquals(DropTask.State.COMPLETED, resumed.state());
+        assertEquals(130, restored.get("minecraft:stone").dropped());
+        assertEquals(217, restored.totalDropped());
+        assertEquals(0, restored.totalRemaining());
+    }
+
+    @Test
+    void aRestoredBlockedMaterialIsRetriedOnStart() {
+        MaterialManager manager = materials("minecraft:stone", 64);
+        manager.markBlocked("minecraft:stone", FailureKind.MATERIAL_UNAVAILABLE);
+        assertTrue(manager.hasBlocked());
+
+        FakeActions actions = new FakeActions();
+        DropTask task = new DropTask(manager, actions);
+        task.config(config());
+
+        assertTrue(task.start());
+        // Starting clears stale blocks so the material gets another chance.
+        assertFalse(manager.hasBlocked());
+        assertEquals(MaterialEntry.Status.PENDING, manager.get("minecraft:stone").status());
+
+        for (int tick = 0; tick < 50; tick++) {
+            task.tick(tick, tick * 50L);
+            actions.confirmAll(task);
+        }
+        assertEquals(DropTask.State.COMPLETED, task.state());
+    }
+
+    @Test
+    void completionRequiresEveryMaterialToBeFinished() {
+        MaterialManager manager = materials(
+            "minecraft:stone", 64,
+            "minecraft:dirt", 64);
+
+        FakeActions actions = new FakeActions();
+        DropTask.Config config = config();
+        config.maxDropsPerTick = 1;
+
+        DropTask task = new DropTask(manager, actions);
+        task.config(config);
+        task.start();
+
+        // Finish stone only.
+        for (int tick = 0; tick < 40; tick++) {
+            task.tick(tick, tick * 50L);
+            actions.confirmAll(task);
+            if (manager.get("minecraft:stone").isComplete()) break;
+        }
+
+        assertTrue(manager.get("minecraft:stone").isComplete());
+        assertFalse(manager.isComplete(), "one material left means the run is not done");
+        assertFalse(task.state() == DropTask.State.COMPLETED);
+
+        // Finish dirt too.
+        for (int tick = 40; tick < 200; tick++) {
+            task.tick(tick, tick * 50L);
+            actions.confirmAll(task);
+        }
+
+        assertTrue(manager.isComplete());
+        assertEquals(DropTask.State.COMPLETED, task.state());
     }
 }

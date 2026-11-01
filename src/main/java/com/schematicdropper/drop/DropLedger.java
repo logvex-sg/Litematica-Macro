@@ -31,6 +31,12 @@ public final class DropLedger {
         CONFIRMED,
         /** Not confirmed in time; the caller should resend. */
         RETRY,
+        /**
+         * Not confirmed in time, and resending is disabled. The request stays
+         * outstanding: the server may simply be slow, and a resend could duplicate
+         * items that were in fact created. The caller waits and revalidates.
+         */
+        TIMED_OUT,
         /** Out of retries; the caller must not count this and should stop. */
         STALLED
     }
@@ -43,6 +49,8 @@ public final class DropLedger {
 
         private long sentTick;
         private int attempts = 1;
+        /** Set once the request has exceeded the confirmation window. */
+        private boolean timedOut;
 
         Request(long id, String itemId, int count, long sentTick) {
             this.id = id;
@@ -71,9 +79,15 @@ public final class DropLedger {
             return attempts;
         }
 
+        /** True once this request has waited longer than the confirmation window. */
+        public boolean timedOut() {
+            return timedOut;
+        }
+
         @Override
         public String toString() {
-            return "#" + id + " " + itemId + " x" + count + " (try " + attempts + ")";
+            return "#" + id + " " + itemId + " x" + count + " (try " + attempts + ")"
+                + (timedOut ? " [timed out]" : "");
         }
     }
 
@@ -148,7 +162,6 @@ public final class DropLedger {
             used += head.count;
             resolutions.add(new Resolution(head.id, head.itemId, head.count, Outcome.CONFIRMED));
         }
-
         committed.put(itemId, used);
         return resolutions;
     }
@@ -157,19 +170,26 @@ public final class DropLedger {
      * Expires requests that were never confirmed.
      *
      * <p>Called once per client tick. A request still inside {@code timeoutTicks}
-     * is left alone. One that has run out of time is either queued for another
-     * attempt or declared stalled.
+     * is left alone. One that has run out of time is retried, declared timed out,
+     * or declared stalled, depending on the retry budget and on whether resending
+     * is allowed at all.
      *
      * <p>A retry is a genuine second send, so it raises the item's send ceiling.
      * That matters because a retry can produce a second batch of item entities:
      * if both are seen, both are real items in the world and both should be
-     * credited. Retrying is off by default for exactly this reason - a server
-     * that is merely slow would receive a duplicate drop.
+     * credited.
      *
-     * @param timeoutTicks how long to wait for a confirmation before retrying
-     * @param maxAttempts  total sends allowed per request, including the first
+     * <p>When {@code resendAllowed} is false the request is reported as
+     * {@link Outcome#TIMED_OUT} <em>without</em> being resent and <em>without</em>
+     * being removed: a server that is merely slow would receive a duplicate drop,
+     * so the safe behaviour is to keep waiting. This is what stops a timeout from
+     * ever duplicating a drop.
+     *
+     * @param timeoutTicks  how long to wait for a confirmation before acting
+     * @param maxAttempts   total sends allowed per request, including the first
+     * @param resendAllowed whether a timed-out request may be resent at all
      */
-    public List<Resolution> poll(long tick, int timeoutTicks, int maxAttempts) {
+    public List<Resolution> poll(long tick, int timeoutTicks, int maxAttempts, boolean resendAllowed) {
         List<Resolution> resolutions = new ArrayList<>();
 
         for (Map.Entry<String, Deque<Request>> entry : outstanding.entrySet()) {
@@ -179,6 +199,17 @@ public final class DropLedger {
             while (!queue.isEmpty()) {
                 Request head = queue.peekFirst();
                 if (tick - head.sentTick < timeoutTicks) break;
+
+                if (!resendAllowed) {
+                    // Report the timeout once, then leave the request queued. It is
+                    // still outstanding, so its items stay counted against the
+                    // target and a late confirmation is still honoured.
+                    if (!head.timedOut) {
+                        head.timedOut = true;
+                        resolutions.add(new Resolution(head.id, itemId, head.count, Outcome.TIMED_OUT));
+                    }
+                    break;
+                }
 
                 if (head.attempts >= maxAttempts) {
                     // Give up on this one but leave the rest of the queue intact.
@@ -197,6 +228,13 @@ public final class DropLedger {
         }
 
         return resolutions;
+    }
+
+    /**
+     * Backwards-compatible overload: allows resending, as the original ledger did.
+     */
+    public List<Resolution> poll(long tick, int timeoutTicks, int maxAttempts) {
+        return poll(tick, timeoutTicks, maxAttempts, true);
     }
 
     /** Drops every request and observation for an item, used when a material is abandoned. */
@@ -230,12 +268,43 @@ public final class DropLedger {
         return total;
     }
 
+    /**
+     * Total items ever sent for an item, counting a retry as a second send.
+     *
+     * <p>Exposed so a caller (or a test) can confirm that a timeout did not
+     * secretly resend, which would raise this figure.
+     */
+    public int sentTotal(String itemId) {
+        return sentTotal.getOrDefault(itemId, 0);
+    }
+
     /** True when nothing is in flight, so the caller may safely advance. */
     public boolean isEmpty() {
         for (Deque<Request> queue : outstanding.values()) {
             if (!queue.isEmpty()) return false;
         }
         return true;
+    }
+
+    /** True when any outstanding request has exceeded the confirmation window. */
+    public boolean hasTimedOut() {
+        for (Deque<Request> queue : outstanding.values()) {
+            for (Request request : queue) {
+                if (request.timedOut) return true;
+            }
+        }
+        return false;
+    }
+
+    /** True when an outstanding request for this item has exceeded the window. */
+    public boolean hasTimedOut(String itemId) {
+        Deque<Request> queue = outstanding.get(itemId);
+        if (queue == null) return false;
+
+        for (Request request : queue) {
+            if (request.timedOut) return true;
+        }
+        return false;
     }
 
     /** Snapshot of every outstanding request, for diagnostics. */

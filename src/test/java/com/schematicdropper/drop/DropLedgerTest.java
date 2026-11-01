@@ -263,4 +263,54 @@ class DropLedgerTest {
         assertEquals(DropLedger.Outcome.STALLED, resolutions.get(0).outcome());
         assertTrue(ledger.isEmpty());
     }
+
+    @Test
+    void aTimeoutWithResendingDisabledIsReportedOnceAndKeepsTheRequest() {
+        DropLedger ledger = new DropLedger();
+        ledger.send("minecraft:stone", 64, 0);
+
+        // Resending is off, so the first expiry is reported as TIMED_OUT...
+        List<DropLedger.Resolution> resolutions = ledger.poll(10, 10, 3, false);
+        assertEquals(1, resolutions.size());
+        assertEquals(DropLedger.Outcome.TIMED_OUT, resolutions.get(0).outcome());
+
+        // ...but the request stays outstanding: nothing was removed and no second
+        // send was recorded, so a slow server can still confirm it.
+        assertEquals(1, ledger.outstandingRequests("minecraft:stone"));
+        assertEquals(64, ledger.outstandingItems("minecraft:stone"));
+        assertTrue(ledger.hasTimedOut());
+
+        // The same expiry is not reported again while it remains timed out.
+        assertTrue(ledger.poll(20, 10, 3, false).isEmpty());
+
+        // A late confirmation is still honoured.
+        resolutions = ledger.observe("minecraft:stone", 64, 21);
+        assertEquals(1, resolutions.size());
+        assertEquals(DropLedger.Outcome.CONFIRMED, resolutions.get(0).outcome());
+        assertTrue(ledger.isEmpty());
+    }
+
+    @Test
+    void aTimeoutNeverProducesASecondSendWhenResendingIsDisabled() {
+        DropLedger ledger = new DropLedger();
+        ledger.send("minecraft:stone", 64, 0);
+
+        for (int tick = 0; tick < 100; tick++) {
+            ledger.poll(tick, 5, 3, false);
+        }
+
+        // The send ceiling never rose, which is what proves no resend happened.
+        assertEquals(64, ledger.sentTotal("minecraft:stone"));
+        assertEquals(1, ledger.outstandingRequests("minecraft:stone"));
+    }
+
+    @Test
+    void hasTimedOutIsFalseWhileAResendIsAllowed() {
+        DropLedger ledger = new DropLedger();
+        ledger.send("minecraft:stone", 64, 0);
+
+        ledger.poll(10, 10, 3, true);
+        // A resend resets the timer, so the request is not stuck waiting.
+        assertFalse(ledger.hasTimedOut());
+    }
 }

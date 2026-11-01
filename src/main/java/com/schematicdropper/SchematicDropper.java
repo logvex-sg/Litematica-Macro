@@ -88,6 +88,12 @@ public class SchematicDropper extends Module {
     /** Counts client ticks, used for drop confirmation timeouts. */
     private long tickCounter;
 
+    /** Counts client ticks between periodic run-state saves. */
+    private long saveCounter;
+
+    /** How often (in ticks) an active run's progress is written to the config. */
+    private static final int SAVE_INTERVAL_TICKS = 100;
+
     /** The entity targeted when the run started, for the target-change notification. */
     private Entity lastNotifiedTarget;
 
@@ -119,19 +125,29 @@ public class SchematicDropper extends Module {
     @Override
     public void onActivate() {
         tickCounter = 0;
+        saveCounter = 0;
         lastNotifiedTarget = null;
 
         if (materials.isEmpty()) {
-            importFromConfiguredSource(false);
+            // Prefer the run left over from last session, so unfinished work is
+            // never lost to a restart. Only fall back to the configured source
+            // when there is nothing to restore.
+            restoreSavedRun();
+            if (materials.isEmpty()) importFromConfiguredSource(false);
         }
     }
 
     @Override
     public void onDeactivate() {
         // Stop cleanly so nothing is left half-applied, and so no task can keep
-        // running after the module is switched off.
+        // running after the module is switched off. Progress is saved first so the
+        // queue survives being switched off.
+        //
+        // reset() is deliberately NOT called here: it clears progress, which would
+        // throw away the very run that was just saved. stop() keeps it, and
+        // onActivate restores it from the config anyway.
+        saveRunState();
         task.stop();
-        task.reset();
         inventory.cancelPending();
         targets.clearLock();
         lastNotifiedTarget = null;
@@ -154,7 +170,9 @@ public class SchematicDropper extends Module {
     @Override
     public String getInfoString() {
         return switch (task.state()) {
-            case RUNNING, PAUSED -> (int) Math.round(materials.overallProgress() * 100) + "%";
+            case RUNNING, PAUSED, RETRYING, RECOVERING, BLOCKED,
+                 WAITING_FOR_INVENTORY, WAITING_FOR_TARGET, WAITING_FOR_SERVER ->
+                (int) Math.round(materials.overallProgress() * 100) + "%";
             case COMPLETED -> "done";
             case ERROR -> "error";
             default -> materials.isEmpty() ? null : materials.size() + " mats";
@@ -186,17 +204,16 @@ public class SchematicDropper extends Module {
                 settings.hudShowTarget.get());
         }
 
-        if (task.isRunning() && !inventory.isCreative()) {
-            // The server ignores creative packets from a non-creative player, so
-            // carrying on would only produce unconfirmable drops.
-            task.abortForWorldChange("Creative mode is required; stopping");
-            reportNotices();
-            return;
-        }
-
         updateTargeting();
         task.tick(tickCounter, System.currentTimeMillis());
         reportNotices();
+
+        // Persist progress periodically so an unexpected exit cannot lose the
+        // unfinished queue. Saving every tick would write the config constantly.
+        if (task.isActive() && ++saveCounter >= SAVE_INTERVAL_TICKS) {
+            saveCounter = 0;
+            saveRunState();
+        }
 
         if (settings.hudEnabled.get()) {
             SchematicDropperHud.refresh(task, materials, currentTargetLabel());
@@ -206,7 +223,7 @@ public class SchematicDropper extends Module {
     @EventHandler
     private void onEntityAdded(EntityAddedEvent event) {
         if (!(event.entity instanceof ItemEntity itemEntity)) return;
-        if (task.state() != DropTask.State.RUNNING && task.state() != DropTask.State.PAUSED) return;
+        if (!task.isActive()) return;
         if (mc.player == null) return;
 
         // Only items that appear close to the player can be ours. Without this,
@@ -229,7 +246,7 @@ public class SchematicDropper extends Module {
 
     @EventHandler
     private void onGameLeft(GameLeftEvent event) {
-        if (task.state() == DropTask.State.RUNNING || task.state() == DropTask.State.PAUSED) {
+        if (task.isActive()) {
             task.abortForWorldChange("Disconnected; the drop was stopped");
             reportNotices();
         }
@@ -336,6 +353,22 @@ public class SchematicDropper extends Module {
         public int maxStackSize(String itemId) {
             Item item = ItemResolver.findItem(itemId);
             return item == null ? 64 : Math.max(1, item.getMaxCount());
+        }
+
+        @Override
+        public boolean itemAvailable(String itemId) {
+            return ItemResolver.exists(itemId);
+        }
+
+        @Override
+        public boolean inventoryReady() {
+            return inventory.canAct();
+        }
+
+        @Override
+        public boolean targetValid() {
+            if (settings.targetMode.get() != DropTargetManager.Mode.LOOKED_AT_ENTITY) return true;
+            return targets.resolve(settings.targetMode.get(), settings.targetRange.get()).isOk();
         }
     }
 
@@ -487,7 +520,7 @@ public class SchematicDropper extends Module {
 
     private void applyMaterials(Map<String, Integer> materialsMap, String sourceName, boolean announce) {
         task.stop();
-        materials.setFrom(materialsMap);
+        materials.setFrom(materialsMap, settings.order());
 
         if (settings.ignoreAir.get()) {
             materials.removeNoItemBlocks(ItemResolver::isNoItemBlock);
@@ -500,13 +533,53 @@ public class SchematicDropper extends Module {
             return;
         }
 
+        saveRunState();
+
         if (announce) {
             info("Loaded %d material(s), %d items from %s",
                 materials.size(), materials.totalRequired(), sourceName);
+            info("Order: %s", settings.order());
             if (missing > 0) {
                 warning("%d material(s) have no matching item and will be skipped", missing);
             }
         }
+    }
+
+    // ----------------------------------------------------------- PERSISTENCE
+
+    /** Writes the material list and the run's progress into the module's config. */
+    public void saveRunState() {
+        settings.savedMaterialList.set(materials.serializeRun());
+        settings.savedRunState.set(settings.order().name());
+    }
+
+    /**
+     * Restores the run saved by {@link #saveRunState()}, if any.
+     *
+     * <p>The unfinished queue, its order and every material's confirmed progress
+     * are restored exactly, so a restart resumes rather than losing work. The
+     * order is carried inside the saved data, so a change to the ordering setting
+     * does not reshuffle an in-flight run.
+     *
+     * @return how many materials were restored
+     */
+    public int restoreSavedRun() {
+        String data = settings.savedMaterialList.get();
+        if (data == null || data.isBlank()) return 0;
+
+        int restored = materials.deserializeRun(data);
+        if (restored == 0) return 0;
+
+        if (settings.ignoreAir.get()) {
+            materials.removeNoItemBlocks(ItemResolver::isNoItemBlock);
+        }
+        task.validateMaterials(ItemResolver::exists);
+
+        String order = settings.savedRunState.get();
+        info("Restored %d unfinished material(s), %d items left (order: %s)",
+            materials.size(), materials.totalRemaining(),
+            order == null || order.isBlank() ? settings.order().toString() : order);
+        return materials.size();
     }
 
     // ---------------------------------------------------------------- CONTROL
@@ -557,6 +630,7 @@ public class SchematicDropper extends Module {
     public void stop() {
         task.stop();
         inventory.cancelPending();
+        saveRunState();
         reportNotices();
     }
 
@@ -565,6 +639,7 @@ public class SchematicDropper extends Module {
         task.stop();
         task.reset();
         materials.clear();
+        saveRunState();
         info("Material list cleared");
     }
 
@@ -579,7 +654,8 @@ public class SchematicDropper extends Module {
             switch (notice.kind()) {
                 case COMPLETED -> info("%s", notice.message());
                 case STALLED, ERROR -> error("%s", notice.message());
-                case MISSING_ITEM, CANCELLED -> warning("%s", notice.message());
+                case BLOCKED -> warning("%s", notice.message());
+                case MISSING_ITEM, CANCELLED, RECOVERED, WAITING -> warning("%s", notice.message());
             }
         }
     }

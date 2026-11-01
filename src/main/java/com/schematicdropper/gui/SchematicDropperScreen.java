@@ -92,6 +92,10 @@ public class SchematicDropperScreen extends WidgetScreen {
             module.materials().resetProgress();
             rebuild();
         });
+        button(buttons, "Restore Run", () -> {
+            module.restoreSavedRun();
+            rebuild();
+        });
 
         statusLabel = controls.add(theme.label("")).widget();
 
@@ -184,6 +188,7 @@ public class SchematicDropperScreen extends WidgetScreen {
     private static Color statusColor(MaterialEntry entry) {
         return switch (entry.status()) {
             case MISSING, STALLED -> new Color(255, 100, 100);
+            case BLOCKED -> new Color(255, 190, 90);
             case DONE -> new Color(120, 220, 120);
             case RUNNING -> new Color(120, 180, 255);
             default -> null;
@@ -205,6 +210,12 @@ public class SchematicDropperScreen extends WidgetScreen {
 
         int missing = materials.missingCount();
         if (missing > 0) text.append("   Missing: ").append(missing);
+
+        int blocked = materials.blockedCount();
+        if (blocked > 0) {
+            text.append("   Blocked: ").append(blocked)
+                .append(" (").append(materials.blockedRemaining()).append(" items)");
+        }
 
         String error = module.task().lastError();
         if (error != null) text.append("   (").append(error).append(')');

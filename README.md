@@ -116,6 +116,53 @@ Glass   17
 Partial stacks are handled, quantities are never exceeded, and a one-item
 requirement never becomes a full stack.
 
+## Strict material order
+
+Materials are processed in a fixed, deterministic order, never at random. The
+order is chosen when the list is imported and never changes during a run:
+
+| Strategy | Order |
+|---|---|
+| **Schematic order** (default) | The order the schematic or Litematica material list produced. |
+| **Imported list order** | The order the `.txt` / `.json` / `.csv` file listed them in. |
+| **Alphabetical** | Ascending item id. |
+| **Required quantity** | Largest requirement first. |
+
+In the default **Strict order** run mode the material at the front of the queue is
+finished - every stack of it - before the next material is touched. The example
+above is processed Stone, then Dirt, then Glass, with no interleaving. A material
+that cannot be processed right now keeps its place in the queue and is resumed
+from its exact remaining quantity; later materials are not touched while it is
+outstanding.
+
+The alternative **Best effort** mode temporarily marks an unavailable material
+blocked, continues with the materials that can be processed in their original
+relative order, and revisits the blocked ones periodically. The run is not
+complete while any blocked quantity remains.
+
+## Failure recovery
+
+A failed drop never ends the run. Each failure is classified and recorded, and the
+scheduler reacts to it:
+
+| Classification | Response |
+|---|---|
+| `TEMPORARY_FAILURE` | Retry after a backoff. |
+| `INVENTORY_CHANGED` | Wait for the creative inventory to be usable again. |
+| `TARGET_INVALID` | Wait for a valid look target. |
+| `SERVER_TIMEOUT` | Keep the request outstanding and wait; do not resend by default. |
+| `SERVER_REJECTION` | Retry, then block the material if it keeps failing. |
+| `MATERIAL_UNAVAILABLE` | Block the material and revisit it later. |
+| `PERMANENT_ERROR` | Do not retry; keep the work unfinished and report it. |
+
+Retries are bounded per material and use an exponential backoff (configurable base
+delay, ceiling, and maximum attempts). A material that keeps failing is marked
+**BLOCKED** rather than abandoned: it keeps its queue position and its remaining
+quantity, and the scheduler revisits it. The scheduler reports which condition it
+is waiting on (`RETRYING`, `RECOVERING`, `BLOCKED`, `WAITING_FOR_INVENTORY`,
+`WAITING_FOR_TARGET`, `WAITING_FOR_SERVER`) and does not re-send an identical
+request while it is waiting.
+
 ### Confirmed drops, not assumed drops
 
 This is the part that matters on a multiplayer server.
@@ -151,8 +198,10 @@ budget that is already spent.
 
 A drop that is never confirmed is **not** resent by default. A server that is
 merely slow would receive a second drop and the world would end up with duplicates.
-The run stops instead, which is the safe failure. Resending can be enabled
-deliberately with the `max-attempts` setting.
+The request is kept outstanding, the material is reported as waiting on the
+server, and a late confirmation is still honoured. Resending can be enabled
+deliberately with the `allow-resend` setting, which trades that safety for
+resilience on a genuinely lossy connection.
 
 ## Creative inventory
 
@@ -203,13 +252,21 @@ mode and a target line toggle.
 
 ## Configuration
 
-Input source, selected schematic, material list, target mode, range, drop speed,
-inventory strategy, HUD settings, filtering and the current material list are all
-persisted by Meteor's own config system.
+Input source, selected schematic, material list, material order, run mode, target
+mode, range, drop speed, retry and backoff behaviour, inventory strategy, HUD
+settings and filtering are all persisted by Meteor's own config system.
+
+The loaded material list, its processing order and every material's confirmed
+progress are saved too, so an interrupted run is restored when the module is
+switched back on: the unfinished queue, the order and the exact remaining
+quantities all survive a restart. Progress is written periodically during a run
+and whenever the run stops or the module is disabled. The **Restore Run** button
+reloads it on demand.
 
 A run is **never** restarted automatically. If the connection or the world changes
 mid-run, the task stops, marks itself as needing an explicit restart, and says so.
-Resuming is a deliberate action.
+Resuming is a deliberate action - but it resumes the unfinished queue rather than
+starting over.
 
 ## Meteor initialisation order
 
@@ -238,6 +295,9 @@ built.
 - A second `Start` while a run is active is refused, so a double-click cannot
   launch two competing operations.
 - Disabling the module stops the task, clears the lock and removes the HUD.
+- A failed drop never ends the run: it is classified, recorded and either retried
+  with a bounded backoff, waited out, or used to block the material so it can be
+  revisited.
 - Stale parse results are discarded by generation counter, so an abandoned import
   cannot overwrite a newer one.
 - Null and disconnect checks throughout; the module is inert when no world or
@@ -249,14 +309,22 @@ built.
 ./gradlew test
 ```
 
-126 tests covering material list parsing, duplicate merging, identifier
+162 tests covering material list parsing, duplicate merging, identifier
 validation, stack arithmetic, partial stacks, zero quantities, missing materials,
 progress tracking, cancellation, resume, duplicate-drop prevention, confirmation
 accounting and the exact-quantity contract end to end.
 
+The ordering and recovery behaviour has its own coverage: schematic, imported,
+alphabetical and required-quantity ordering; multiple stacks of one material;
+a temporarily unavailable first material; a failed operation followed by a
+successful retry; a server timeout that does not duplicate the drop; an inventory
+that changes during execution; a target that disappears; Best Effort revisiting a
+blocked material; Strict Order never advancing prematurely; and restarting a run
+without losing its unfinished queue.
+
 The scheduler keeps no Minecraft types - everything that touches the game goes
-through a small `Actions` interface - so the whole exact-quantity path is tested
-without a running game.
+through a small `Actions` interface - so the whole exact-quantity, ordering and
+recovery path is tested without a running game.
 
 ## Limitations
 
@@ -268,6 +336,8 @@ without a running game.
   contains; the modern formats are the reliable path.
 - Litematica integration is only as accurate as Litematica's own material list,
   which is the point - it is the same list Litematica shows.
+- Strict order waits for the head material indefinitely; if it can never be
+  obtained, switch to Best effort to let the rest of the queue proceed.
 
 ## Building
 

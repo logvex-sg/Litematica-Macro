@@ -3,8 +3,10 @@ package com.schematicdropper;
 import com.schematicdropper.drop.CreativeInventoryHandler;
 import com.schematicdropper.drop.DropTargetManager;
 import com.schematicdropper.drop.DropTask;
+import com.schematicdropper.drop.RunMode;
 import com.schematicdropper.material.ImportFormat;
 import com.schematicdropper.material.MaterialManager;
+import com.schematicdropper.material.MaterialOrder;
 import meteordevelopment.meteorclient.settings.BoolSetting;
 import meteordevelopment.meteorclient.settings.DoubleSetting;
 import meteordevelopment.meteorclient.settings.EnumSetting;
@@ -50,6 +52,9 @@ public final class SchematicDropperSettings {
     public final Setting<String> materialListPath;
     public final Setting<Boolean> useSelectedPlacement;
     public final Setting<Boolean> ignoreAir;
+    public final Setting<MaterialOrder> materialOrder;
+
+    public final Setting<RunMode> runMode;
 
     public final Setting<Integer> itemsPerSecond;
     public final Setting<Integer> maxDropsPerTick;
@@ -58,6 +63,15 @@ public final class SchematicDropperSettings {
     public final Setting<Integer> maxPerDrop;
     public final Setting<Integer> confirmTimeoutTicks;
     public final Setting<Integer> maxAttempts;
+    public final Setting<Boolean> allowResend;
+    public final Setting<Integer> retryDelayTicks;
+    public final Setting<Integer> maxRetryDelayTicks;
+    public final Setting<Integer> maxRetriesPerOperation;
+    public final Setting<Integer> revisitBlockedTicks;
+
+    /** Serialised run state, so an interrupted run is restored instead of lost. */
+    public final Setting<String> savedMaterialList;
+    public final Setting<String> savedRunState;
 
     public final Setting<DropTargetManager.Mode> targetMode;
     public final Setting<Double> targetRange;
@@ -113,6 +127,18 @@ public final class SchematicDropperSettings {
             .defaultValue(true)
             .build());
 
+        materialOrder = general.add(new EnumSetting.Builder<MaterialOrder>()
+            .name("material-order")
+            .description("The deterministic order materials are processed in. Fixed for the whole run.")
+            .defaultValue(MaterialOrder.SCHEMATIC_ORDER)
+            .build());
+
+        runMode = general.add(new EnumSetting.Builder<RunMode>()
+            .name("run-mode")
+            .description("Strict order finishes each material before advancing. Best effort skips an unavailable material and revisits it.")
+            .defaultValue(RunMode.STRICT_ORDER)
+            .build());
+
         itemsPerSecond = speed.add(new IntSetting.Builder()
             .name("items-per-second")
             .description("Upper bound on items sent per second. The server refuses more than 200 drops per second.")
@@ -163,10 +189,48 @@ public final class SchematicDropperSettings {
 
         maxAttempts = speed.add(new IntSetting.Builder()
             .name("max-attempts")
-            .description("Sends allowed per drop. Leave at 1 so an unconfirmed drop stops the run; a higher value can duplicate items if the server was only slow.")
+            .description("Sends allowed per drop before it is treated as lost. Only relevant when allow-resend is on; a higher value can duplicate items if the server was only slow.")
             .defaultValue(1)
             .range(1, 5)
             .sliderRange(1, 5)
+            .build());
+
+        allowResend = speed.add(new BoolSetting.Builder()
+            .name("allow-resend")
+            .description("Resend a drop the server has not confirmed in time. Off by default: a slow server would receive a duplicate drop.")
+            .defaultValue(false)
+            .build());
+
+        retryDelayTicks = speed.add(new IntSetting.Builder()
+            .name("retry-delay")
+            .description("Ticks to wait before retrying a failed operation. Backs off exponentially up to the maximum.")
+            .defaultValue(10)
+            .range(1, 200)
+            .sliderRange(1, 100)
+            .build());
+
+        maxRetryDelayTicks = speed.add(new IntSetting.Builder()
+            .name("max-retry-delay")
+            .description("Ceiling for the retry backoff, in ticks.")
+            .defaultValue(100)
+            .range(1, 400)
+            .sliderRange(1, 200)
+            .build());
+
+        maxRetriesPerOperation = speed.add(new IntSetting.Builder()
+            .name("max-retries")
+            .description("Failed attempts for one material before it is marked blocked and revisited later.")
+            .defaultValue(5)
+            .range(1, 50)
+            .sliderRange(1, 20)
+            .build());
+
+        revisitBlockedTicks = speed.add(new IntSetting.Builder()
+            .name("revisit-blocked")
+            .description("Ticks between attempts to recover blocked materials.")
+            .defaultValue(100)
+            .range(10, 1200)
+            .sliderRange(20, 600)
             .build());
 
         inventoryStrategy = general.add(new EnumSetting.Builder<CreativeInventoryHandler.Strategy>()
@@ -244,6 +308,25 @@ public final class SchematicDropperSettings {
             .description("Show the current drop target and mode.")
             .defaultValue(true)
             .build());
+
+        // Persisted run state. Hidden from the settings screen because they are
+        // written by the module, not edited by the user, but they are stored by
+        // Meteor's own config so an interrupted run survives a restart.
+        savedMaterialList = general.add(new StringSetting.Builder()
+            .name("saved-material-list")
+            .description("The loaded material list, saved automatically so it survives a restart.")
+            .defaultValue("")
+            .wide()
+            .visible(() -> false)
+            .build());
+
+        savedRunState = general.add(new StringSetting.Builder()
+            .name("saved-run-state")
+            .description("The unfinished queue and confirmed progress, saved automatically.")
+            .defaultValue("")
+            .wide()
+            .visible(() -> false)
+            .build());
     }
 
     /** Copies the settings into the scheduler's plain config object. */
@@ -256,6 +339,18 @@ public final class SchematicDropperSettings {
         config.confirmTimeoutTicks = confirmTimeoutTicks.get();
         config.maxAttempts = maxAttempts.get();
         config.targetMode = targetMode.get();
+        config.runMode = runMode.get();
+        config.allowResend = allowResend.get();
+        config.retryDelayTicks = retryDelayTicks.get();
+        config.maxRetryDelayTicks = maxRetryDelayTicks.get();
+        config.maxRetriesPerOperation = maxRetriesPerOperation.get();
+        config.revisitBlockedTicks = revisitBlockedTicks.get();
+    }
+
+    /** The ordering strategy currently selected. */
+    public MaterialOrder order() {
+        MaterialOrder value = materialOrder.get();
+        return value == null ? MaterialOrder.SCHEMATIC_ORDER : value;
     }
 
     /** The format of the configured material list file, or {@code null}. */
