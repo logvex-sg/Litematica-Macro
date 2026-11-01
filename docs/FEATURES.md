@@ -237,6 +237,24 @@ cancellation and its resume behaviour - runs and is tested with no game at all.
 The 23 tests in `DropTaskTest` drive the whole exact-quantity path through a fake
 `Actions`.
 
+### Meteor initialisation order
+
+Meteor 0.5.8 runs addon initialisation in two passes:
+
+| Pass | Called by | What may be done |
+|---|---|---|
+| `onRegisterCategories()` | `Categories.init()`, with `Categories.REGISTERING` set | `Modules.registerCategory(...)`, and nothing else - it throws outside this callback |
+| `onInitialize()` | `MeteorClient.onInitializeClient`, after `Categories.init()` has returned | `Modules.get().add(...)`, HUD registration |
+
+`Modules.add` rejects a module whose category is not in the registered list
+(`Modules.addModule - Module's category was not registered`), so the category has
+to be created in pass 1 and used in pass 2. It cannot be a field initialiser: the
+class would be loaded before `REGISTERING` is set, so the registration would throw.
+
+`SchematicDropperAddon.CATEGORY` is assigned inside `onRegisterCategories()`. It
+is declared `public static` but deliberately left unassigned until then, so a
+class-loading order mistake cannot produce a category Meteor has never seen.
+
 ### Threading
 
 Schematic parsing runs on a single-thread daemon executor. The result is applied

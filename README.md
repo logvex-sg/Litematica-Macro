@@ -211,6 +211,27 @@ A run is **never** restarted automatically. If the connection or the world chang
 mid-run, the task stops, marks itself as needing an explicit restart, and says so.
 Resuming is a deliberate action.
 
+## Meteor initialisation order
+
+Meteor 0.5.8 initialises addons in two passes, and the addon has to use both:
+
+1. `MeteorClient.onInitializeClient` calls `Categories.init()`. That sets
+   `Categories.REGISTERING`, registers Meteor's own six categories, and then calls
+   `onRegisterCategories()` on every addon. **Only inside that callback** may
+   `Modules.registerCategory(Category)` be called - it throws otherwise.
+2. `onInitialize()` runs later. This is the only place a module may be added:
+   `Modules.add` rejects a module whose category is not in the registered list,
+   with `Modules.addModule - Module's category was not registered`.
+
+So the category is created in `onRegisterCategories()` and used in
+`onInitialize()`. It is deliberately **not** a field initialiser: a category built
+during class loading would be constructed before `REGISTERING` is set, so
+registering it would throw, and it would never be registered at all.
+
+`SchematicDropperAddon.CATEGORY` is the field the module constructor reads. It is
+assigned inside `onRegisterCategories()`, so it is populated before any module is
+built.
+
 ## Reliability
 
 - Parsing runs off the client thread; results are applied on it.

@@ -12,3 +12,4 @@ out/
 .settings/
 .DS_Store
 .openhands/
+logs/
